@@ -47,6 +47,9 @@ npm run test:mock
 
 ### Local mock profile (no Testnet or Telegram)
 
+For a five-minute quickstart walking through the mock RPC, scanner, and rendered
+notifications without tokens, see [docs/quickstart-mock.md](docs/quickstart-mock.md).
+
 Rehearse failure drills against a loopback Soroban mock instead of live services:
 
 ```bash
@@ -95,5 +98,6 @@ table.
 
 - `src/` — the TypeScript source (config, RPC client, decoder, poller, bot, audit).
 - `tests/` — Node built-in test runner suites compiled against `dist/`.
+- `docs/quickstart-mock.md` — five-minute quickstart using the local mock RPC.
 - `docs/contributor-fixtures.md` — credential-free fixture guide and failure modes.
 - `.env.example` — the documented runtime settings (not required for testing).
