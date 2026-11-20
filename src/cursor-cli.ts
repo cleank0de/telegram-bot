@@ -10,7 +10,13 @@ import { config as loadDotenv } from "dotenv";
 import { pathToFileURL } from "node:url";
 
 import { acquireInstanceLock } from "./instanceLock.js";
-import { parseAndMigrateCursorFile } from "./poller.js";
+import {
+  appendCursorRecoveryHistory,
+  parseAndMigrateCursorFile,
+  snapshotCursorPositions,
+  type CursorRecoveryPosition,
+  type CursorRecoveryRecord,
+} from "./poller.js";
 
 export interface BackupCursorOptions {
   cursorFile: string;
@@ -20,6 +26,7 @@ export interface BackupCursorOptions {
 
 export interface RestoreCursorOptions extends BackupCursorOptions {
   lockFile: string;
+  now?: () => Date;
 }
 
 async function exists(filePath: string): Promise<boolean> {
@@ -83,18 +90,73 @@ export async function restoreCursor(options: RestoreCursorOptions): Promise<void
   try {
     const raw = await readFile(options.backupFile, "utf8");
     const parsed = validateCursor(raw);
-    if (!options.force && (await exists(options.cursorFile))) {
+    const liveExists = await exists(options.cursorFile);
+    if (!options.force && liveExists) {
       throw new Error(`cursor already exists at ${options.cursorFile}; pass --force to replace it`);
     }
-    const normalized = `${JSON.stringify(parsed.file, null, 2)}\n`;
+
+    let before: Record<string, CursorRecoveryPosition> = {};
+    let priorHistory: CursorRecoveryRecord[] = parsed.file.recoveryHistory ?? [];
+    if (liveExists) {
+      try {
+        const liveRaw = await readFile(options.cursorFile, "utf8");
+        const liveParsed = parseAndMigrateCursorFile(liveRaw);
+        before = snapshotCursorPositions(liveParsed.file.targets);
+        priorHistory = liveParsed.file.recoveryHistory ?? [];
+      } catch {
+        // Unreadable or corrupt live cursor: record empty before-positions
+        // without copying raw bytes or secrets into recovery history.
+        before = {};
+        priorHistory = [];
+      }
+    }
+
+    const after = snapshotCursorPositions(parsed.file.targets);
+    const recoveryHistory = appendCursorRecoveryHistory(priorHistory, {
+      at: (options.now ?? (() => new Date()))().toISOString(),
+      reason: "restore",
+      before,
+      after,
+    });
+    const nextFile = {
+      ...parsed.file,
+      recoveryHistory,
+    };
+
+    const normalized = `${JSON.stringify(nextFile, null, 2)}\n`;
     await writeAtomic(options.cursorFile, normalized, options.force === true);
     console.log(
-      `[cursor] restored schema=v${parsed.file.version} targets=${Object.keys(parsed.file.targets).length} ` +
+      `[cursor] restored schema=v${nextFile.version} targets=${Object.keys(nextFile.targets).length} ` +
         `from ${options.backupFile} to ${options.cursorFile}`,
     );
   } finally {
     await lock.release();
   }
+}
+
+function summarizePositions(positions: Record<string, CursorRecoveryPosition>): string {
+  const entries = Object.entries(positions);
+  if (entries.length === 0) return "none";
+  return entries
+    .map(([source, pos]) => {
+      const ledger =
+        typeof pos.rewindFromLedger === "number"
+          ? `rewind@${pos.rewindFromLedger}`
+          : pos.lastEventLedger !== null
+            ? `ledger=${pos.lastEventLedger}`
+            : pos.cursor !== null
+              ? "cursor=set"
+              : "none";
+      return `${source}:${ledger}`;
+    })
+    .join(",");
+}
+
+/** Read and print the bounded recovery history from a validated cursor file. */
+export async function readCursorRecoveryHistory(cursorFile: string): Promise<CursorRecoveryRecord[]> {
+  const raw = await readFile(cursorFile, "utf8");
+  const parsed = validateCursor(raw);
+  return parsed.file.recoveryHistory ?? [];
 }
 
 interface CliOptions {
@@ -145,12 +207,27 @@ function assertDifferentPaths(left: string, right: string): void {
 async function main(): Promise<void> {
   loadDotenv({ path: process.env.DOTENV_CONFIG_PATH || ".env" });
   const [action, ...args] = process.argv.slice(2);
-  if (action !== "backup" && action !== "restore") {
-    throw new Error("usage: npm run cursor -- <backup|restore> [--file PATH] [--out PATH|--from PATH] [--force]");
+  if (action !== "backup" && action !== "restore" && action !== "history") {
+    throw new Error(
+      "usage: npm run cursor -- <backup|restore|history> [--file PATH] [--out PATH|--from PATH] [--force]",
+    );
   }
 
   const options = parseOptions(args);
   const cursorFile = resolvePath(options.file ?? process.env.CURSOR_FILE ?? "./data/cursor.json");
+  if (action === "history") {
+    const history = await readCursorRecoveryHistory(cursorFile);
+    console.log(`[cursor] recovery history (${history.length}) for ${cursorFile}`);
+    for (const record of history) {
+      const targetPart = record.source ? ` source=${record.source}` : "";
+      console.log(
+        `  ${record.at} reason=${record.reason}${targetPart} ` +
+          `before=[${summarizePositions(record.before)}] after=[${summarizePositions(record.after)}]`,
+      );
+    }
+    return;
+  }
+
   if (action === "backup") {
     const backupFile = resolvePath(
       options.out ?? `${cursorFile}.${new Date().toISOString().replace(/[:.]/g, "-")}.bak`,

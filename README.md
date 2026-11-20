@@ -213,6 +213,7 @@ checkout; the Docker image already includes the compiled CLI.
 npm run cursor -- backup
 npm run cursor -- backup --out /safe-storage/cursor-before-deploy.json
 npm run cursor -- restore --from /safe-storage/cursor-before-deploy.json --force
+npm run cursor -- history
 ```
 
 Restore validates and normalizes the backup to the current version-1 cursor
@@ -223,6 +224,14 @@ command fail; stale locks are handled by the same PID check used at startup.
 Restoring an existing cursor requires `--force`; malformed or future-version
 files are always rejected. The command prints only paths, schema version, and
 target count, never opaque cursor contents.
+
+Cursor recovery actions (automatic floor rewinds, operator restores, and
+corrupt-file quarantines) append a bounded entry to `recoveryHistory` (at most
+20 most-recent entries) inside `CURSOR_FILE`. Each entry records the UTC
+timestamp, reason, and before/after target positions (`cursor`,
+`lastEventLedger`, and optional `rewindFromLedger`) — never event payloads,
+event IDs, or secrets. Run `npm run cursor -- history` to inspect a summary of
+retained recovery entries without printing opaque cursor strings.
 
 Keep backups on persistent storage separate from the deployment's writable
 cursor when possible. On Railway, a one-off command must use the same attached

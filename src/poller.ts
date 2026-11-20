@@ -366,6 +366,33 @@ export interface PollerStatus {
 /** Current on-disk cursor schema. Bump when the shape of `targets` changes. */
 export const CURSOR_SCHEMA_VERSION = 1 as const;
 
+/** Maximum number of cursor recovery records retained in the cursor file. */
+export const MAX_CURSOR_RECOVERY_HISTORY = 20 as const;
+
+/** Bounded set of reasons a cursor recovery record can carry. */
+export type CursorRecoveryReason = "floor_rewind" | "restore" | "quarantine";
+
+/** Minimal cursor position snapshot (never includes event IDs, payloads, or secrets). */
+export interface CursorRecoveryPosition {
+  cursor: string | null;
+  lastEventLedger: number | null;
+  rewindFromLedger?: number | null;
+}
+
+/** One bounded recovery history record persisted in the cursor file. */
+export interface CursorRecoveryRecord {
+  /** ISO-8601 UTC timestamp of when the recovery occurred. */
+  at: string;
+  /** Bounded recovery reason. */
+  reason: CursorRecoveryReason;
+  /** Target source when a single target was recovered (e.g. floor_rewind). */
+  source?: string;
+  /** Target positions before recovery. */
+  before: Record<string, CursorRecoveryPosition>;
+  /** Target positions after recovery. */
+  after: Record<string, CursorRecoveryPosition>;
+}
+
 export interface CursorFile {
   version: typeof CURSOR_SCHEMA_VERSION;
   updatedAt: string;
@@ -376,6 +403,13 @@ export interface CursorFile {
    */
   chainClockAt?: number | null;
   targets: Record<string, CursorTarget>;
+  /**
+   * Bounded history of cursor recovery actions (floor rewinds, operator
+   * restores, and corrupt-file quarantines), oldest first. Optional and
+   * additive: files written before this field existed load with an empty
+   * history, and older builds ignore it.
+   */
+  recoveryHistory?: CursorRecoveryRecord[];
 }
 
 interface CursorTarget {
@@ -454,6 +488,145 @@ function parseRewindFromLedger(value: unknown): number | null {
   if (value === null || value === undefined) return null;
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) return null;
   return value;
+}
+
+const VALID_RECOVERY_REASONS = new Set<CursorRecoveryReason>([
+  "floor_rewind",
+  "restore",
+  "quarantine",
+]);
+
+function parseRecoveryPosition(value: unknown): CursorRecoveryPosition | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const obj = value as Record<string, unknown>;
+
+  let cursor: string | null = null;
+  if (obj.cursor === null || obj.cursor === undefined) {
+    cursor = null;
+  } else if (typeof obj.cursor === "string") {
+    if (obj.cursor.length > 256) return null;
+    cursor = obj.cursor.length > 0 ? obj.cursor : null;
+  } else {
+    return null;
+  }
+
+  let lastEventLedger: number | null = null;
+  if (obj.lastEventLedger === null || obj.lastEventLedger === undefined) {
+    lastEventLedger = null;
+  } else if (
+    typeof obj.lastEventLedger === "number" &&
+    Number.isSafeInteger(obj.lastEventLedger) &&
+    obj.lastEventLedger >= 0
+  ) {
+    lastEventLedger = obj.lastEventLedger;
+  } else {
+    return null;
+  }
+
+  const rewindFromLedger = parseRewindFromLedger(obj.rewindFromLedger);
+  return {
+    cursor,
+    lastEventLedger,
+    ...(rewindFromLedger !== null ? { rewindFromLedger } : {}),
+  };
+}
+
+function parseRecoveryPositionMap(value: unknown): Record<string, CursorRecoveryPosition> | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const out: Record<string, CursorRecoveryPosition> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (key.length === 0 || key.length > 64) return null;
+    const pos = parseRecoveryPosition(entry);
+    if (pos === null) return null;
+    out[key] = pos;
+  }
+  return out;
+}
+
+function sanitizeRecoveryRecord(value: unknown): CursorRecoveryRecord | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const obj = value as Record<string, unknown>;
+  if (
+    typeof obj.at !== "string" ||
+    obj.at.length === 0 ||
+    obj.at.length > 64 ||
+    Number.isNaN(Date.parse(obj.at))
+  ) {
+    return null;
+  }
+  if (typeof obj.reason !== "string" || !VALID_RECOVERY_REASONS.has(obj.reason as CursorRecoveryReason)) {
+    return null;
+  }
+  if (obj.source !== undefined && (typeof obj.source !== "string" || obj.source.length === 0 || obj.source.length > 64)) {
+    return null;
+  }
+  const before = parseRecoveryPositionMap(obj.before);
+  const after = parseRecoveryPositionMap(obj.after);
+  if (before === null || after === null) return null;
+
+  return {
+    at: obj.at,
+    reason: obj.reason as CursorRecoveryReason,
+    ...(typeof obj.source === "string" ? { source: obj.source } : {}),
+    before,
+    after,
+  };
+}
+
+/**
+ * Parse and bound a persisted `recoveryHistory` array. Malformed entries are
+ * dropped rather than failing cursor load — recovery metadata must never cost
+ * an operator their resume position — and any unknown fields (such as event
+ * payloads or secrets) are stripped.
+ */
+export function parseRecoveryHistory(
+  value: unknown,
+  maxEntries: number = MAX_CURSOR_RECOVERY_HISTORY,
+): CursorRecoveryRecord[] {
+  if (!Array.isArray(value) || maxEntries <= 0) return [];
+  const valid: CursorRecoveryRecord[] = [];
+  for (const item of value) {
+    const clean = sanitizeRecoveryRecord(item);
+    if (clean !== null) valid.push(clean);
+  }
+  return valid.length > maxEntries ? valid.slice(-maxEntries) : valid;
+}
+
+/**
+ * Snapshot only the position metadata (cursor, lastEventLedger, optional
+ * rewindFromLedger) for a map of targets, excluding event IDs, payloads, and
+ * secrets.
+ */
+export function snapshotCursorPositions(
+  targets: Record<string, Pick<CursorTarget, "cursor" | "lastEventLedger" | "rewindFromLedger">>,
+): Record<string, CursorRecoveryPosition> {
+  const out: Record<string, CursorRecoveryPosition> = {};
+  for (const [source, target] of Object.entries(targets)) {
+    out[source] = {
+      cursor: target.cursor ?? null,
+      lastEventLedger: target.lastEventLedger ?? null,
+      ...(typeof target.rewindFromLedger === "number"
+        ? { rewindFromLedger: target.rewindFromLedger }
+        : {}),
+    };
+  }
+  return out;
+}
+
+/**
+ * Append a recovery record to an existing history, sanitizing all fields and
+ * retaining at most `maxEntries` most-recent records.
+ */
+export function appendCursorRecoveryHistory(
+  history: readonly CursorRecoveryRecord[] | undefined,
+  record: CursorRecoveryRecord,
+  maxEntries: number = MAX_CURSOR_RECOVERY_HISTORY,
+): CursorRecoveryRecord[] {
+  const existing = parseRecoveryHistory(history ?? [], maxEntries);
+  const clean = sanitizeRecoveryRecord(record);
+  if (clean === null || maxEntries <= 0) return existing;
+  const combined = [...existing, clean];
+  return combined.length > maxEntries ? combined.slice(-maxEntries) : combined;
 }
 
 /** Tuning knobs for Telegram delivery; defaults suit production, tests shrink them. */
@@ -797,12 +970,18 @@ export function parseCursorFile(raw: string): CursorFile {
     };
   }
 
+  const recoveryHistory =
+    parsed.recoveryHistory !== undefined
+      ? parseRecoveryHistory(parsed.recoveryHistory)
+      : [];
+
   return {
     version: 1,
     updatedAt: parsed.updatedAt ?? "",
     // Additive field: only present when the file carried it.
     ...(parsed.chainClockAt !== undefined ? { chainClockAt: parseChainClock(parsed.chainClockAt) } : {}),
     targets,
+    ...(recoveryHistory.length > 0 ? { recoveryHistory } : {}),
   };
 }
 
@@ -947,6 +1126,10 @@ export function parseAndMigrateCursorFile(
         : nowIso;
     const file: CursorFile = { version: CURSOR_SCHEMA_VERSION, updatedAt, targets };
     if (parsed.chainClockAt !== undefined) file.chainClockAt = parseChainClock(parsed.chainClockAt);
+    if (parsed.recoveryHistory !== undefined) {
+      const recoveryHistory = parseRecoveryHistory(parsed.recoveryHistory);
+      if (recoveryHistory.length > 0) file.recoveryHistory = recoveryHistory;
+    }
     return {
       file,
       migrated: typeof parsed.updatedAt !== "string" || parsed.updatedAt.length === 0,
@@ -998,7 +1181,10 @@ export function buildCursorFile(
   }>,
   updatedAt: string,
   chainClockAt?: number | null,
+  recoveryHistory?: readonly CursorRecoveryRecord[],
 ): CursorFile {
+  const boundedHistory =
+    recoveryHistory !== undefined ? parseRecoveryHistory(recoveryHistory) : [];
   return {
     version: CURSOR_SCHEMA_VERSION,
     updatedAt,
@@ -1018,6 +1204,7 @@ export function buildCursorFile(
         } satisfies CursorTarget,
       ]),
     ),
+    ...(boundedHistory.length > 0 ? { recoveryHistory: boundedHistory } : {}),
   };
 }
 
@@ -1434,6 +1621,9 @@ export function createPoller(deps: PollerDeps) {
     targets.map((t) => [t.source, 0]),
   );
 
+  /** Bounded history of cursor recovery actions persisted alongside cursors. */
+  let recoveryHistory: CursorRecoveryRecord[] = [];
+
   // Per-contract redelivery guard. Kept out of `TargetState` so status output
   // stays plain data; the window is internal bookkeeping.
   const dedup = new Map<ContractSource, EventDedupWindow>(
@@ -1758,6 +1948,7 @@ export function createPoller(deps: PollerDeps) {
       // between two quiet scans would report `unknown` until the next event
       // happened to land, hiding a perfectly healthy (or long-stalled) chain.
       status.chainClockAt = parsed.chainClockAt ?? null;
+      recoveryHistory = parsed.recoveryHistory ? [...parsed.recoveryHistory] : [];
       audit.record(
         auditEntry("cursor_loaded", {
           detail: [...state.values()].map((t) => `${t.source}@${t.cursor ?? "none"}`).join(" "),
@@ -1785,6 +1976,14 @@ export function createPoller(deps: PollerDeps) {
       // keep the bad bytes for operators instead of overwriting them on save.
       const reason = errorMessage(err);
       await quarantineCorruptCursorFile(config.cursorFile, reason);
+      recoveryHistory = appendCursorRecoveryHistory(recoveryHistory, {
+        at: new Date(now()).toISOString(),
+        reason: "quarantine",
+        before: {},
+        after: snapshotCursorPositions(
+          Object.fromEntries([...state.values()].map((t) => [t.source, t])),
+        ),
+      });
     }
   }
 
@@ -1808,6 +2007,7 @@ export function createPoller(deps: PollerDeps) {
       })),
       new Date(now()).toISOString(),
       status.chainClockAt,
+      recoveryHistory,
     );
 
     try {
@@ -2354,9 +2554,29 @@ export function createPoller(deps: PollerDeps) {
     const missed = cursorLedger === null ? 0 : Math.max(0, window.oldestLedger - cursorLedger);
     rewindAttempts.set(target.source, attempts + 1);
     const at = now();
+    const beforePosition: CursorRecoveryPosition = {
+      cursor: current.cursor,
+      lastEventLedger: current.lastEventLedger,
+      ...(typeof current.rewindFromLedger === "number"
+        ? { rewindFromLedger: current.rewindFromLedger }
+        : {}),
+    };
     current.cursor = null;
     current.lastEventLedger = null;
     current.rewindFromLedger = window.oldestLedger;
+    recoveryHistory = appendCursorRecoveryHistory(recoveryHistory, {
+      at: new Date(at).toISOString(),
+      reason: "floor_rewind",
+      source: target.source,
+      before: { [target.source]: beforePosition },
+      after: {
+        [target.source]: {
+          cursor: current.cursor,
+          lastEventLedger: current.lastEventLedger,
+          rewindFromLedger: current.rewindFromLedger,
+        },
+      },
+    });
     // The position becomes a floor walk, so any "could not be read" flag it
     // carried is spent. The gap itself is what an operator needs, and it is
     // recorded once per occurrence: after the rewind the position *is* the
